@@ -1,7 +1,10 @@
-import math 
+
+
+import math
+import re
+
 import torch
-import torch.nn as nn 
-import re 
+import torch.nn as nn
 
 """
 This is sample from the Arc :
@@ -18,6 +21,9 @@ transformer_blocks.0.ff.ff.2 : Linear(in_features=2048, out_features=1024, bias=
 transformer_blocks.1.attn_norm.linear : Linear(in_features=1024, out_features=6144, bias=True)
 """
 
+
+
+
 TARGET_PRESETS = {
     "attn": [r"transformer_blocks\.\d+\.attn\.to_q$", r"transformer_blocks\.\d+\.attn\.to_k$",
              r"transformer_blocks\.\d+\.attn\.to_v$", r"transformer_blocks\.\d+\.attn\.to_out\.0$"],
@@ -25,12 +31,13 @@ TARGET_PRESETS = {
     "adaln": [r"transformer_blocks\.\d+\.attn_norm\.linear$"],
 }
 
+# parameters trained FULLY (not LoRA) when train_text=True: token embeddings + the text ConvNeXt blocks
 TEXT_TRAIN_PATTERNS = [r"transformer\.text_embed\.text_embed\.", r"transformer\.text_embed\.text_blocks\."]
- 
+
 
 class LoRALinear(nn.Module):
     """y = W x + b + (alpha / r) * B(A(dropout(x)))   with W, b frozen."""
- 
+
     def __init__(self, base: nn.Linear, r: int = 16, alpha: float = 32.0, dropout: float = 0.0):
         super().__init__()
         assert isinstance(base, nn.Linear)
@@ -44,16 +51,17 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         for p in self.base.parameters():
             p.requires_grad = False
- 
+
     def forward(self, x):
         out = self.base(x)
         delta = (self.dropout(x) @ self.lora_A.t().to(x.dtype)) @ self.lora_B.t().to(x.dtype)
         return out + delta * self.scaling
 
+
 def _match(name, patterns):
     return any(re.search(p, name) for p in patterns)
- 
- 
+
+
 def resolve_targets(targets):
     """'attn,ff' (or a list) -> list of regex patterns."""
     if isinstance(targets, str):
@@ -64,6 +72,7 @@ def resolve_targets(targets):
             raise ValueError(f"unknown LoRA target '{t}', choose from {list(TARGET_PRESETS)}")
         patterns += TARGET_PRESETS[t]
     return patterns
+
 
 def inject_lora(model: nn.Module, targets="attn,ff", r=16, alpha=32.0, dropout=0.0):
     """Replace matching nn.Linear modules by LoRALinear. Returns the list of replaced module names."""
@@ -76,7 +85,8 @@ def inject_lora(model: nn.Module, targets="attn,ff", r=16, alpha=32.0, dropout=0
         parent = model.get_submodule(parent_name) if parent_name else model
         parent._modules[child] = LoRALinear(lin, r=r, alpha=alpha, dropout=dropout)
     return [n for n, _ in found]
- 
+
+
 def set_trainable(model: nn.Module, train_text: bool = True):
     """Freeze everything, then unfreeze LoRA matrices (+ text embedding / text blocks if train_text)."""
     for p in model.parameters():
@@ -104,16 +114,16 @@ def param_groups(model: nn.Module, lr_lora: float, lr_text: float):
     return groups
 
 
-def trainable_state_dict(model: nn.Module):
-    """Only what training changed (small): LoRA matrices + fully-trained text parameters."""
-    return {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
- 
-
 def count_params(model: nn.Module):
     total = sum(p.numel() for p in model.parameters())
     train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, train
- 
+
+
+def trainable_state_dict(model: nn.Module):
+    """Only what training changed (small): LoRA matrices + fully-trained text parameters."""
+    return {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
+
 
 def load_trainable_state_dict(model: nn.Module, sd: dict):
     params = dict(model.named_parameters())
@@ -127,8 +137,8 @@ def load_trainable_state_dict(model: nn.Module, sd: dict):
     not_in_ckpt = expected - set(sd)
     if not_in_ckpt:
         raise RuntimeError(f"{len(not_in_ckpt)} trainable params are missing in the LoRA checkpoint, e.g. {sorted(not_in_ckpt)[:3]}")
- 
- 
+
+
 @torch.no_grad()
 def merge_and_unload(model: nn.Module):
     """W <- W + scaling * B @ A, then put the plain nn.Linear back. Result = stock F5-TTS structure."""
@@ -143,7 +153,13 @@ def merge_and_unload(model: nn.Module):
             p.requires_grad = False
     return model
 
+
+# ----------------------------------------------------------------------------------------------
+# new language: grow the text embedding table
+# ----------------------------------------------------------------------------------------------
 EMBED_KEY = "transformer.text_embed.text_embed.weight"
+
+
 @torch.no_grad()
 def expand_embedding_rows(weight: torch.Tensor, new_rows: int, seed: int = 0):
     """weight: (old_rows, dim) -> (new_rows, dim). Old rows are kept (same indices); new rows start near the
@@ -156,4 +172,4 @@ def expand_embedding_rows(weight: torch.Tensor, new_rows: int, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     w = weight.float()
     extra = w.mean(0, keepdim=True) + 0.5 * w.std() * torch.randn(new_rows - old_rows, dim, generator=g)
-    return torch.cat([weight, extra.to(weight.dtype)], dim=0)  
+    return torch.cat([weight, extra.to(weight.dtype)], dim=0)
