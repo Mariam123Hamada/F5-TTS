@@ -1,3 +1,8 @@
+"""
+Smoke test for the LoRA code on a TINY F5-TTS model (CPU, a few seconds, no downloads).
+Run it before any long training:   python test/smoke_test_lora.py   (run from the root of the fork, after `pip install -e .`)
+"""
+
 import copy
 import random
 
@@ -26,11 +31,20 @@ DEPTH = 2
 
 def tiny():
     torch.manual_seed(1)
-    return CFM(
+    model = CFM(
         transformer=DiT(dim=64, depth=DEPTH, heads=2, dim_head=32, ff_mult=2, text_dim=32, conv_layers=2,
                         text_num_embeds=len(VOCAB), mel_dim=100),
         mel_spec_kwargs=MEL, vocab_char_map=VOCAB,
     )
+    # F5's DiT zero-initialises its AdaLN gates and its output projection, so a FRESH model has blocks that do nothing
+    # and no gradient can reach them. A real pretrained checkpoint has non-zero values there, so emulate that here;
+    # otherwise the test would report "no grad on lora_B" for a perfectly healthy LoRA implementation.
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        for _, p in model.named_parameters():
+            if p.numel() > 0 and p.abs().sum() == 0:
+                p.copy_(torch.randn(p.shape, generator=g) * 0.02)
+    return model
 
 
 def loss_of(model, seed=0):
