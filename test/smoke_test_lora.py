@@ -43,7 +43,7 @@ def tiny():
     with torch.no_grad():
         for _, p in model.named_parameters():
             if p.numel() > 0 and p.abs().sum() == 0:
-                p.copy_(torch.randn(p.shape, generator=g) * 0.02)
+                p.copy_(torch.randn(p.shape, generator=g) * 0.1)
     return model
 
 
@@ -56,17 +56,29 @@ def loss_of(model, seed=0):
     return loss
 
 
+def out_of(model, seed=0):
+    """Like loss_of, but also returns the raw model prediction: far more sensitive than the scalar MSE loss, whose
+    change can be tiny in a small random model even when the layers do change the output."""
+    torch.manual_seed(seed)
+    random.seed(seed)
+    mel = torch.randn(2, 40, 100)
+    loss, _, pred = model(mel, text=["abc a", "bca"], lens=torch.tensor([40, 30]))
+    return loss, pred
+
+
 def main():
     base = tiny().eval()
     keys_before = set(base.state_dict().keys())
-    loss_base = loss_of(base)
+    loss_base, pred_base = out_of(base)
 
     # 1) injection: right number of layers, and the model output is unchanged at init (B = 0)
     model = copy.deepcopy(base)
     names = inject_lora(model, "attn,ff", r=4, alpha=8, dropout=0.0)
     assert len(names) == DEPTH * 6, f"expected {DEPTH * 6} LoRA layers, got {len(names)}: {names}"
     assert all(isinstance(model.get_submodule(n), LoRALinear) for n in names)
-    assert torch.allclose(loss_of(model.eval()), loss_base, atol=1e-6), "LoRA must not change the output at init"
+    loss_init, pred_init = out_of(model.eval())
+    assert torch.allclose(pred_init, pred_base, atol=1e-6), "LoRA must not change the output at init"
+    assert torch.allclose(loss_init, loss_base, atol=1e-6)
     print("1) injection OK:", len(names), "layers, output identical at init")
 
     # 2) only LoRA + text params are trainable
@@ -92,23 +104,27 @@ def main():
     with torch.no_grad():
         for n, p in model.named_parameters():
             if "lora_B" in n:
-                p.copy_(torch.randn_like(p) * 0.05)
+                p.copy_(torch.randn_like(p) * 0.2)
     model.eval()
-    loss_lora = loss_of(model)
+    loss_lora, pred_lora = out_of(model)
     sd_trainable = trainable_state_dict(model)
     merged = merge_and_unload(copy.deepcopy(model)).eval()
-    loss_merged = loss_of(merged)
-    assert torch.allclose(loss_lora, loss_merged, atol=1e-5), (loss_lora.item(), loss_merged.item())
-    assert not torch.allclose(loss_lora, loss_base, atol=1e-6), "LoRA had no effect after perturbing B"
+    loss_merged, pred_merged = out_of(merged)
+    effect = (pred_lora - pred_base).abs().max().item()
+    assert effect > 1e-4, f"LoRA had no effect on the prediction after perturbing B (max diff {effect:.2e})"
+    err = (pred_lora - pred_merged).abs().max().item()
+    assert torch.allclose(pred_lora, pred_merged, atol=1e-5, rtol=1e-4), f"merged model differs from the LoRA model (max diff {err:.2e})"
     assert set(merged.state_dict().keys()) == keys_before, "merged model must have the stock key names"
-    print(f"4) merge OK: loss {loss_lora.item():.5f} == {loss_merged.item():.5f}; stock key names restored")
+    print(f"4) merge OK: LoRA changes the prediction by up to {effect:.3f}; merged model matches it (max diff {err:.1e}); "
+          f"stock key names restored")
 
     # 5) save / load of the trainable parameters
     fresh = copy.deepcopy(base)
     inject_lora(fresh, "attn,ff", r=4, alpha=8, dropout=0.0)
     set_trainable(fresh, train_text=True)
     load_trainable_state_dict(fresh, sd_trainable)
-    assert torch.allclose(loss_of(fresh.eval()), loss_lora, atol=1e-6)
+    _, pred_fresh = out_of(fresh.eval())
+    assert torch.allclose(pred_fresh, pred_lora, atol=1e-6), "reloaded LoRA parameters do not reproduce the model"
     print("5) trainable state dict round-trip OK")
 
     # 6) vocabulary extension keeps the old rows
