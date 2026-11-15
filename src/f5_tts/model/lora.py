@@ -21,9 +21,9 @@ transformer_blocks.0.ff.ff.2 : Linear(in_features=2048, out_features=1024, bias=
 transformer_blocks.1.attn_norm.linear : Linear(in_features=1024, out_features=6144, bias=True)
 """
 
-
-
-
+# ----------------------------------------------------------------------------------------------
+# which Linear layers get LoRA (names are relative to CFM: transformer.transformer_blocks.<i>.<...>)
+# ----------------------------------------------------------------------------------------------
 TARGET_PRESETS = {
     "attn": [r"transformer_blocks\.\d+\.attn\.to_q$", r"transformer_blocks\.\d+\.attn\.to_k$",
              r"transformer_blocks\.\d+\.attn\.to_v$", r"transformer_blocks\.\d+\.attn\.to_out\.0$"],
@@ -173,3 +173,40 @@ def expand_embedding_rows(weight: torch.Tensor, new_rows: int, seed: int = 0):
     w = weight.float()
     extra = w.mean(0, keepdim=True) + 0.5 * w.std() * torch.randn(new_rows - old_rows, dim, generator=g)
     return torch.cat([weight, extra.to(weight.dtype)], dim=0)
+
+
+# ----------------------------------------------------------------------------------------------
+# validation
+# ----------------------------------------------------------------------------------------------
+@torch.no_grad()
+def val_loss_sum(model: nn.Module, loader, device, seed: int = 1234, max_batches: int = 0):
+    """Flow-matching loss on held-out batches. CFM.forward draws a random time, noise and masks, so the RNGs are
+    seeded here: every call sees the same draws and the numbers of different checkpoints are comparable.
+    The global RNG states (torch cpu/cuda, python) are restored afterwards, so training is not affected.
+    Returns (sum of per-batch losses, number of batches)."""
+    was_training = model.training
+    model.eval()
+    device = torch.device(device)
+    use_cuda = device.type == "cuda"
+    cpu_state, py_state = torch.get_rng_state(), random.getstate()
+    cuda_state = torch.cuda.get_rng_state(device) if use_cuda else None
+    torch.manual_seed(seed)
+    random.seed(seed)
+    total, n = 0.0, 0
+    try:
+        for batch in loader:
+            mel = batch["mel"].permute(0, 2, 1).to(device)
+            lens = batch["mel_lengths"].to(device)
+            loss, _, _ = model(mel, text=batch["text"], lens=lens)
+            total += float(loss.item())
+            n += 1
+            if max_batches and n >= max_batches:
+                break
+    finally:
+        torch.set_rng_state(cpu_state)
+        random.setstate(py_state)
+        if use_cuda:
+            torch.cuda.set_rng_state(cuda_state, device)
+        if was_training:
+            model.train()
+    return total, n
