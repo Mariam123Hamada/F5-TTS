@@ -1,5 +1,3 @@
-
-
 import copy
 import random
 
@@ -17,6 +15,7 @@ from f5_tts.model.lora import (
     param_groups,
     set_trainable,
     trainable_state_dict,
+    val_loss_sum,
 )
 
 MEL = dict(n_fft=1024, hop_length=256, win_length=1024, n_mel_channels=100, target_sample_rate=24000, mel_spec_type="vocos")
@@ -103,6 +102,19 @@ def main():
     w2 = expand_embedding_rows(w, w.shape[0] + 5)
     assert w2.shape == (w.shape[0] + 5, w.shape[1]) and torch.equal(w2[: w.shape[0]], w)
     print("6) embedding expansion OK:", tuple(w.shape), "->", tuple(w2.shape))
+
+    # 7) validation loss: deterministic, and it does not disturb the global RNG (training must be unaffected)
+    batch = {"mel": torch.randn(2, 100, 40), "text": ["abc a", "bca"], "mel_lengths": torch.tensor([40, 30])}
+    model.eval()
+    torch.manual_seed(5)
+    before = torch.rand(3)
+    torch.manual_seed(5)
+    s1, n1 = val_loss_sum(model, [batch], "cpu")
+    after = torch.rand(3)
+    s2, n2 = val_loss_sum(model, [batch], "cpu")
+    assert n1 == n2 == 1 and abs(s1 - s2) < 1e-7, f"validation loss must be repeatable: {s1} vs {s2}"
+    assert torch.equal(before, after), "val_loss_sum must restore the global RNG state"
+    print(f"7) validation loss OK: repeatable ({s1:.5f}) and RNG state restored")
 
     print("\nSMOKE TEST PASSED")
 
