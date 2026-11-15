@@ -26,6 +26,7 @@ from f5_tts.model.lora import (
     param_groups,
     set_trainable,
     trainable_state_dict,
+    val_loss_sum,
 )
 from f5_tts.model.utils import get_tokenizer
 
@@ -69,6 +70,10 @@ def parse_args():
     p.add_argument("--keep_last_n", type=int, default=2)
     p.add_argument("--max_hours", type=float, default=0.0, help="stop cleanly after this many hours (0 = no limit)")
     p.add_argument("--log_every", type=int, default=50)
+    # validation (held-out recordings, see prepare_arabic_hf.py)
+    p.add_argument("--val_dataset_name", default=None, help="e.g. saudi_lora_val  -> data/saudi_lora_val_custom")
+    p.add_argument("--val_per_updates", type=int, default=1000)
+    p.add_argument("--val_max_batches", type=int, default=60, help="batches per validation pass (0 = whole set)")
     p.add_argument("--seed", type=int, default=666)
     # export
     p.add_argument("--export_only", action="store_true", help="merge LoRA into the base weights and write model_merged.safetensors")
@@ -186,6 +191,14 @@ def main():
     dataloader = DataLoader(train_dataset, collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True,
                             persistent_workers=args.num_workers > 0, batch_sampler=batch_sampler)
 
+    val_loader = None
+    if args.val_dataset_name:
+        val_dataset = load_dataset(args.val_dataset_name, "custom", mel_spec_kwargs=MEL_CFG)
+        val_batches = DynamicBatchSampler(SequentialSampler(val_dataset), args.batch_size_per_gpu,
+                                          max_samples=args.max_samples, random_seed=args.seed, drop_residual=False)
+        val_loader = DataLoader(val_dataset, collate_fn=collate_fn, num_workers=2, pin_memory=True,
+                                batch_sampler=val_batches)
+
     # ---- scheduler: linear warmup then linear decay (same as the stock Trainer) ----
     warmup_updates = args.num_warmup_updates * accelerator.num_processes
     total_updates = math.ceil(len(dataloader) / args.grad_accumulation_steps) * args.epochs
@@ -195,17 +208,21 @@ def main():
     scheduler = SequentialLR(optimizer, schedulers=[warmup, decay], milestones=[warmup_updates])
 
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    if val_loader is not None:
+        val_loader = accelerator.prepare(val_loader)
     raw_model = accelerator.unwrap_model(model)
     trainable_params = [p for p in raw_model.parameters() if p.requires_grad]
 
     # ---- resume ----
     global_update = 0
+    best_val = float("inf")
     if os.path.exists(last_path):
         ck = torch.load(last_path, map_location="cpu", weights_only=True)
         load_trainable_state_dict(raw_model, ck["trainable"])
         optimizer.load_state_dict(ck["optimizer"])
         scheduler.load_state_dict(ck["scheduler"])
         global_update = int(ck["update"])
+        best_val = float(ck.get("best_val", best_val))
         del ck
         log(f"RESUMED from {last_path} at update {global_update}")
 
@@ -224,7 +241,7 @@ def main():
         payload = dict(trainable=trainable_state_dict(raw_model), update=update, meta=meta)
         path = last_path if last else os.path.join(ckpt_dir, f"lora_{update}.pt")
         if last:
-            payload.update(optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict())
+            payload.update(optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(), best_val=best_val)
         tmp = path + ".tmp"
         torch.save(payload, tmp)
         os.replace(tmp, path)                       # atomic: an uploader never sees a half-written file
@@ -235,6 +252,24 @@ def main():
             while len(snaps) > args.keep_last_n:
                 os.remove(os.path.join(ckpt_dir, snaps.pop(0)))
         print(f"saved {'last' if last else 'snapshot'} checkpoint at update {update}", flush=True)
+
+    def run_validation():
+        """Mean validation loss over all processes (one collective call at the end, so ranks cannot deadlock)."""
+        s_, n_ = val_loss_sum(model, val_loader, accelerator.device, seed=1234, max_batches=args.val_max_batches)
+        t = accelerator.gather(torch.tensor([[s_, float(n_)]], device=accelerator.device)).sum(0)
+        return (t[0] / t[1].clamp(min=1)).item()
+
+    def save_best(update, val):
+        if not is_main:
+            return
+        path = os.path.join(ckpt_dir, "lora_best.pt")
+        tmp = path + ".tmp"
+        torch.save(dict(trainable=trainable_state_dict(raw_model), update=update, meta=meta, val_loss=val), tmp)
+        os.replace(tmp, path)
+
+    if val_loader is not None and global_update == 0:
+        v0 = run_validation()
+        log(f"VAL baseline (before any training) | val_loss {v0:.4f}")
 
     # ---- training loop ----
     t0, stop = time.time(), False
@@ -272,6 +307,13 @@ def main():
                     save(global_update, last=True)
                 if global_update % args.save_per_updates == 0:
                     save(global_update, last=False)
+                if val_loader is not None and global_update % args.val_per_updates == 0:
+                    v = run_validation()
+                    improved = v < best_val
+                    if improved:
+                        best_val = v
+                        save_best(global_update, v)
+                    log(f"VAL update {global_update} | val_loss {v:.4f} | best {best_val:.4f}" + ("  <- new best, saved lora_best.pt" if improved else ""))
                 if args.max_hours > 0:                                     # all processes must stop together
                     flag = torch.tensor([int(time.time() - t0 > args.max_hours * 3600)], device=accelerator.device)
                     if accelerator.gather(flag).max().item() > 0:
